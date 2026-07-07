@@ -1,0 +1,85 @@
+At the present moment replenishment rules on Odoo are, at the very least, unsufficient for a (no so complex) full logistic process, the automatic replenishment relies only on min/max rules, and out of that, the rest is manual operations. On top of that the min/max rules are implemented in such a way that the behave greedily, meaning that if we have for example two equal locations requiring 5 units, and there are only 5 units available, the first location that gets to the queue gets the 5 units reserved starving the other location. This greedy behaviour becomes a problem in several ocassions, but it is specially problematic when working with high value stock items under the Hub & Spoke model, where we have limited stock on the hub to distribute accross several shops, where the goal is to have stock distributed, not saturate one shop and starve the rest.
+
+For this purpose we've created the following technical specification for an OCA module that allows to control this exact problem, allowing to overcome the greedy behaviour, but also to alter priority for certain locations, doing so even for certain timeframes.
+
+Temporary Replenishment Priority — Technical Specification
+Status: Draft Module: stock_replenishment_priority (single module; name provisional) Out of scope: site-specific configuration (concrete multipliers, locations, routes), covered in a separate document.
+
+1. Purpose
+A temporary multiplier that scales a location/product's claim on stock when the source cannot satisfy every location at once. When there is enough stock for every location to reach its max, the multiplier has no effect. When there is not, the available stock is divided in proportion to each location's (multiplier × requirement): a location set to 2× has twice the claim of one left at 1×. The module does not forecast demand and does not change how the source itself is replenished.
+
+2. Functional behaviour
+Two stores, both with min/max 10/15 and both empty (each needs 15). One is left at 1×, the other set to 2×.
+
+6 units available. Total demand (30) exceeds supply, so the split applies: the 1× store receives 2, the 2× store receives 4 (proportion 1:2).
+23 units available. The 2× store's proportional share (about 15.3) would exceed its real max of 15, which it does not need, so it is capped at 15 and the surplus flows to the other store: the 2× store receives 15, the 1× store receives 8.
+30 or more units available. No shortage; the multiplier has no effect; both receive 15.
+Properties:
+
+The multiplier is a weight that applies only under contention. It never raises a location above its real max; it only determines who is shorted when stock is scarce.
+A multiplier may be below 1, to lower a location's claim (for example, staff on holiday that day means the location will sell less and should claim less).
+Multipliers stack multiplicatively. A 2× standing through summer combined with a 0.5× on 20 July produces 1× on that day.
+The same logic applies to any number of locations at once; the two-store case is the smallest illustration.
+3. Data model
+One model. Field are indicative/provisional, subjected to changes during development process.
+
+stock.replenishment.multiplier
+
+Field	Type	Notes
+factor	Float	The multiplier. May be below 1.
+date_start, date_end	Date	The demand window: when the effect occurs in the real world. The engine offsets it by lead time (§4).
+product_id / product_tmpl_id / categ_id	M2O	Scope, with fallback (§4).
+location_id	M2O	Scope.
+4. Resolving the effective multiplier
+For a (product, location) pair on the date a replenishment run executes:
+
+Lead-time offset. A record's active window is its demand window shifted earlier by the route lead time, which is the sum of the delay of the stock rules along the chain that replenishes this location/product. A 20 July effect with a 3-day lead time is active on the run executing around 17 July, because that run's stock is what arrives for the 20th. Both edges of the window shift earlier. The lead-time computation is an overridable method, since rule and route structure differ between Odoo versions.
+Stacking. The effective multiplier is the product of factor over every record active on that date, after fallback resolution: product, then category, then location default, then 1.0.
+5. Allocation algorithm
+Each line carries three values: its requested quantity (which is also the most it may receive), its weight (the effective multiplier from §4), and its rounding increment (the pack size it must be shipped in). The algorithm receives all lines competing for the same source and the available quantity at that source, and returns an allocated quantity for each line.
+
+The requested quantity is the line's net requirement as Odoo already computes it (target minus projected on-hand, with incoming and outgoing already accounted for). The weight is used only inside this algorithm; it does not change the requested quantity.
+
+
+Result guarantees: no line receives more than it requested; every allocation is a whole multiple of its rounding increment; the total allocated never exceeds the available quantity.
+
+The algorithm must be implemented as a self-contained calculation with no dependency on the Odoo data layer, so it can be tested on its own and reused unchanged across Odoo versions. The integration layer (§6) supplies its inputs and applies its output.
+
+6. Integration flow
+The allocation runs as a stage of the procurement scheduler, once per run:
+
+Collect the due automatic orderpoints.
+For each, compute its net requirement from its real min/max, using Odoo's standard calculation. The multiplier does not alter min/max at this step.
+Resolve each line's effective multiplier (§4).
+Group lines by (source location, product).
+Take the free-to-reserve quantity at the source as the available quantity. If the total requested across the group fits within it, proceed natively. Otherwise apply the algorithm in §5, using the multipliers as weights.
+Override each orderpoint's order quantity with the result.
+Let Odoo create and reserve the moves. Only currently-free stock is divided; stock already reserved is never reclaimed.
+Invariants this preserves: the net requirement is weighted, never the gross, so re-running cannot re-order stock that is already in transit; only free stock is divided; the module is inert unless the source is contended.
+
+Implementation note — reservation. Reservation behaviour is the main implementation risk. Odoo reserves stock greedily and first-come, and a source that also sells locally has non-internal demand that consumes free stock between the availability snapshot and reservation. The created moves must hold their computed share rather than being reassigned by the default reservation. This should be validated against the contended integration case (§7.3) early, since the rest of the design depends on it.
+
+7. Test cases
+Inputs and expected results, stated independently of any implementation.
+
+7.1 Engine
+Each line is written requested / weight / increment.
+
+Case	Lines	Available	Expected allocation
+No contention	A: 15/1/1, B: 15/2/1	30	A = 15, B = 15
+Proportional split	A: 15/1/1, B: 15/2/1	6	A = 2, B = 4
+Cap and redistribute	A: 15/1/1, B: 15/2/1	23	A = 8, B = 15
+Factor below 1	A: 10/1/1, B: 10/0.5/1	6	A = 4, B = 2
+Indivisible increment	A: 30/1/10, B: 30/1/10	12	A = 10, B = 0
+7.2 Effective multiplier resolution
+Case	Setup	Expected
+Multiplicative stacking	A summer 2× and a 20 July 0.5× both active on 20 July	Effective multiplier = 1.0
+Window offset by lead time	Effect dated 20 July, route lead time 3 days	Active on the 17 July run; inactive on the 20 July run
+7.3 Integration against a live run
+Case	Scenario	Expected
+Contended run	Source holds 6; two spokes, min/max 10/15, both empty; spoke B at 2× today	Move to A = 2, move to B = 4
+No contention	Source holds 40; same two spokes; multiplier present	Each spoke receives its full 15
+Re-run with stock in transit	After a shorted run, an inbound transfer to A is in transit	A's new request covers only the remaining gap
+Reservation under competing demand	Source also has a confirmed local sale drawing on the same free stock	Reserved quantities equal the computed split
+8. Packaging
+Single module, depending on stock, licensed AGPL-3, targeting the stock-logistics-warehouse repository. The scheduler hook point in §6 differs between Odoo versions; the version-specific wiring should be kept thin, behind a single method that performs one batch pass over the competing procurements.
